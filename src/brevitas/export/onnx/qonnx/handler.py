@@ -27,6 +27,7 @@ class BrevitasQuantProxyHandler(ONNXBaseHandler, ABC):
     def validate(self, module):
         if module.bit_width() == 1:
             assert module.zero_point() == 0, "Zero-point not supported for binary quant."
+        assert not module.is_groupwise, "Export with Per Group quantization not supported"
 
     def prepare_for_export(self, module):
         if module.is_quant_enabled:
@@ -71,9 +72,9 @@ class BrevitasWeightQuantProxyHandler(BrevitasQuantProxyHandler):
                 'scale': first_qweight.scale,
                 'zero_point': first_qweight.zero_point,
                 'bit_width': first_qweight.bit_width,
-                'signed': first_qweight.signed,
                 # narrow_range is not a property of the QuantTensor, take it from the proxy instead
                 'narrow_range': module.is_narrow_range,
+                'signed': first_qweight.signed,
                 # override rounding mode since quantization has been pre-applied
                 'rounding_mode': 'ROUND'}
 

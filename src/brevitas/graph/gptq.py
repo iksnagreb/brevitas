@@ -3,9 +3,10 @@
 
 from copy import deepcopy
 import math
-from typing import List, Optional, Set
+from typing import List, Optional
 import warnings
 
+from packaging import version
 import torch
 
 try:
@@ -14,6 +15,7 @@ except:
     LinAlgError = RuntimeError
 import unfoldNd
 
+from brevitas import torch_version
 from brevitas.graph.gpxq import GPxQ
 from brevitas.graph.gpxq import gpxq_mode
 from brevitas.graph.gpxq import StopFwdException
@@ -27,9 +29,17 @@ class gptq_mode(gpxq_mode):
 
     Args:
         model (Module): The model to quantize with GPTQ
+        group_of_parallel_layers (Optional, List[str]): .List of lists where each inner list is a group
+            of layer names that can be optimized in parallel. Default: None
         inplace (bool): Wheter to apply GPTQ inplace or perform a deepcopy. Default: True
+        create_weight_orig (bool): If True, store the original floating point weights before applying
+            gptq. These weights will be used anytime quantization is disabled. Default: True
         use_quant_activations (bool): Wheter to leave quantize activations enabled while performing
             GPTQ. Default: False
+        num_blocks (int): The number of sub-blocks to use to speed-up GPTQ computation. Default: 100
+        act_order (bool): Whether to order greedy path following by Hessian approximation. Default: False
+        return_forward_output (bool): If True, returns the output of the forward pass. Otherwise the
+            forward call inside the context manager returns None. Default: False
 
     Example:
         >>> with torch.no_grad():
@@ -63,8 +73,6 @@ class gptq_mode(gpxq_mode):
             act_order,
             return_forward_output)
 
-        self.orig_forward = self.model.forward
-        self.model.forward = self.catch_stopfwd
         # How many subblock to use during GPTQ for each layer
         self.num_blocks = num_blocks
 
@@ -118,16 +126,21 @@ class GPTQ(GPxQ):
             num_blocks) -> None:
         super().__init__(layer, name, act_order, len_parallel_layers, create_weight_orig)
 
-        dev = self.layer.weight.device
-
         # Define how many columns to update in each mini-block
         self.blocksize = math.ceil(self.columns / num_blocks)
 
         # Initialize Hessian matrix and counter. We need it in float32 to compute the inverse
         self.H = torch.zeros((self.groups, self.columns, self.columns),
-                             device=dev,
-                             dtype=torch.float32)
+                             device='cpu',
+                             dtype=torch.float32,
+                             pin_memory=torch.cuda.is_available())
+        self.B = torch.zeros((self.groups, self.columns, self.columns),
+                             device='cpu',
+                             dtype=torch.float32,
+                             pin_memory=torch.cuda.is_available())
         self.nsamples = 0
+
+        assert torch_version >= version.parse('1.10'), "GPTQ requires torch 1.10 or higher"
 
     def update_batch(self, module, input, current_layer):
         if self.disable_pre_forward_hook:
@@ -148,7 +161,9 @@ class GPTQ(GPxQ):
 
         if isinstance(self.layer, SUPPORTED_CONV_OP):
             # Pick the correct unfoldNd class
-            if isinstance(self.layer, (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d)):
+            if isinstance(
+                    self.layer,
+                (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d, qnn.QuantConvTranspose3d)):
                 unfold_impl = unfoldNd.UnfoldTransposeNd
             else:
                 unfold_impl = unfoldNd.UnfoldNd
@@ -174,7 +189,9 @@ class GPTQ(GPxQ):
         self.H *= self.nsamples / (self.nsamples + batch_size)
         self.nsamples += batch_size
         inp_processed = math.sqrt(2 / self.nsamples) * inp_processed.to(torch.float32)
-        self.H += inp_processed.bmm(inp_processed.transpose(2, 1))
+        # optimizing CPU to GPU transfer using in-place copy to pinned memory
+        self.B.copy_(inp_processed.bmm(inp_processed.transpose(2, 1)))
+        self.H += self.B
         # If we are executing GPTQ with group of parallel layers, we keep track of how many forward
         # we executed. Once we executed as many as the number of parallel_layers, we raise
         # StopFwdException
@@ -184,6 +201,9 @@ class GPTQ(GPxQ):
             raise StopFwdException
 
     def single_layer_update(self, percdamp=.01):
+        assert not self.layer.weight_quant.requires_quant_input, "Error: GPTQ does not support weight quantizers that require quantized inputs."
+        if hasattr(self.layer, 'allocate_params'):
+            self.layer.allocate_params(self.layer)
         weight = self.layer.weight.data
         dev = weight.device
 
@@ -193,7 +213,9 @@ class GPTQ(GPxQ):
         dtype = weight.dtype
 
         if isinstance(self.layer, SUPPORTED_CONV_OP):
-            if isinstance(self.layer, (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d)):
+            if isinstance(
+                    self.layer,
+                (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d, qnn.QuantConvTranspose3d)):
                 weight = weight.transpose(1, 0)  # This performs a view
             weight = weight.flatten(1)
 
@@ -227,7 +249,7 @@ class GPTQ(GPxQ):
         try:
             for i in range(self.groups):
                 damp = percdamp * torch.mean(torch.diag(self.H[i, :, :]))
-                diag = torch.arange(self.columns, device=dev)
+                diag = torch.arange(self.columns, device='cpu')
                 self.H[i, diag, diag] += damp
                 self.H[i, :, :] = torch.linalg.cholesky(self.H[i, :, :])
                 self.H[i, :, :] = torch.cholesky_inverse(self.H[i, :, :])
@@ -240,7 +262,7 @@ class GPTQ(GPxQ):
                 f'Increasing the number of samples might fix this issue')
             return
         finally:
-            del self.H
+            del self.H, self.B
 
         for i1 in range(0, self.columns, self.blocksize):
             i2 = min(i1 + self.blocksize, self.columns)
@@ -260,10 +282,13 @@ class GPTQ(GPxQ):
                     error_block[group_index, :, i] = error
                     # We need to update the original weights
                     weight[group_index, :, perm[i1:i2][i:]] -= (
-                        error.unsqueeze(1).matmul(h_inv_block[group_index, i,
-                                                              i:].unsqueeze(0))).to(dtype)
+                        error.unsqueeze(1).matmul(
+                            h_inv_block[group_index, i, i:].unsqueeze(0).to(dev))).to(dtype)
 
             for group_index in range(self.groups):
                 perm = permutation_list[group_index]
                 weight[group_index, :, perm[i2:]] -= (
-                    error_block[group_index].matmul(h_inv[group_index, i1:i2, i2:])).to(dtype)
+                    error_block[group_index].matmul(h_inv[group_index, i1:i2,
+                                                          i2:].to(dev))).to(dtype)
+        if hasattr(self.layer, 'offload_params'):
+            self.layer.offload_params(self.layer)

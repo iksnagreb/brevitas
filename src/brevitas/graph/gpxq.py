@@ -12,13 +12,20 @@ from typing import List, Optional, Set
 import warnings
 
 import torch
+from torch.fx import GraphModule as TorchGraphModule
 
+from brevitas.fx import GraphModule
+from brevitas.graph.calibrate import disable_return_quant_tensor
 from brevitas.graph.calibrate import DisableEnableQuantization
+from brevitas.graph.calibrate import restore_return_quant_tensor
+from brevitas.graph.utils import is_conv_transposed
 import brevitas.nn as qnn
-from brevitas.quant_tensor import QuantTensor
+from brevitas.quant_tensor import IntQuantTensor
+from brevitas.utils.quant_utils import _CachedIO
 
-SUPPORTED_CONV_OP = (
-    qnn.QuantConv2d, qnn.QuantConv1d, qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d)
+SUPPORTED_TCONV_OP = (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d, qnn.QuantConvTranspose3d)
+
+SUPPORTED_CONV_OP = (qnn.QuantConv1d, qnn.QuantConv2d, qnn.QuantConv3d, *SUPPORTED_TCONV_OP)
 
 
 class StopFwdException(Exception):
@@ -32,6 +39,32 @@ class LayerHandler:
 
 
 class gpxq_mode(ABC):
+    """
+    Apply GPxQ algorithm.
+
+    Args:
+        model (Module): The model to quantize with GPxQ
+        group_of_parallel_layers (Optional, List[str]): .List of lists where each inner list is a group
+            of layer names that can be optimized in parallel. Default: None
+        inplace (bool): Wheter to apply GPFQ inplace or perform a deepcopy. Default: True
+        create_weight_orig (bool): If True, store the original floating point weights before applying
+            gpxq. These weights will be used anytime quantization is disabled. Default: True
+        use_quant_activations (bool): Wheter to leave quantize activations enabled while performing
+            GPxQ. Default: False
+        act_order (bool): Whether to order greedy path following by Hessian approximation. Default: False
+        return_forward_output (bool): If True, returns the output of the forward pass. Otherwise the
+            forward call inside the context manager returns None. Default: False
+
+    Example:
+        >>> with torch.no_grad():
+        >>>     with gpxq_mode(model) as gpxq:
+        >>>         gpxq_mode = gpxq.model
+        >>>         for i in tqdm(range(gpxq.num_layers)):
+        >>>             for img, t in calib_loader:
+        >>>                 img = img.cuda()
+        >>>                 gpxq_mode(img)
+        >>>             gpxq.update()
+    """
 
     def __init__(
             self,
@@ -59,9 +92,16 @@ class gpxq_mode(ABC):
         # How many subblock to use during GPTQ for each layer
 
         self.disable_quant_inference = DisableEnableQuantization()
+        self.return_quant_tensor_state = dict()
 
         self.group_of_parallel_layers = group_of_parallel_layers
         self.return_forward_output = return_forward_output
+
+        self.orig_forward = self.model.forward
+        if isinstance(self.model, (GraphModule, TorchGraphModule)):
+            self.model.__class__.forward = self.catch_stopfwd
+        else:
+            self.model.forward = self.catch_stopfwd
 
     def _is_module_supported(self, module):
         if isinstance(module, SUPPORTED_CONV_OP):
@@ -110,7 +150,9 @@ class gpxq_mode(ABC):
                         gpxq_module_optimizer.update_batch, current_layer=self.current_layer)
                     self.hook_dict[name] = module.register_forward_pre_hook(hook_fn)
                     self.gpxq_layers[name] = gpxq_module_optimizer
+
         if not self.use_quant_activations:
+            self.return_quant_tensor_state = disable_return_quant_tensor(self.model)
             self.disable_quant_inference.disable_act_quantization(
                 self.model, is_training=self.model.training)
             self.disable_quant_inference.disable_bias_quantization(
@@ -120,12 +162,17 @@ class gpxq_mode(ABC):
         return self
 
     def __exit__(self, type, value, traceback):
-        self.model.forward = self.orig_forward
+        if isinstance(self.model, (GraphModule, TorchGraphModule)):
+            self.model.__class__.forward = self.orig_forward
+        else:
+            self.model.forward = self.orig_forward
+
         if not self.use_quant_activations:
             self.disable_quant_inference.enable_act_quantization(
                 self.model, is_training=self.model.training)
             self.disable_quant_inference.enable_bias_quantization(
                 self.model, is_training=self.model.training)
+            restore_return_quant_tensor(self.model, self.return_quant_tensor_state)
 
     def update(self):
         for name in self.current_layer.layer_names:
@@ -145,8 +192,14 @@ class GPxQ(ABC):
         self.layer = layer
         self.name = name
         self.act_order = act_order
+        if self.layer.weight_quant.is_groupwise:
+            weight = self.layer.weight_quant.apply_input_view(self.layer.weight)
+            weight = weight.view(self.layer.weight_quant.quant_injector.reshaped_groupwise_shape)
+            self.layer.weight.data = weight.data
+            self.layer.in_channels = weight.shape[1] if is_conv_transposed(
+                self.layer) else weight.shape[0]
 
-        weight = layer.weight.data
+        weight_shape = torch.tensor(layer.weight.shape)
 
         if create_weight_orig and not hasattr(self.layer, 'weight_orig'):
             self.layer.register_buffer('weight_orig', layer.weight.detach().clone())
@@ -154,46 +207,33 @@ class GPxQ(ABC):
         # By default, use groups = 1
         self.groups = 1
         if isinstance(self.layer, SUPPORTED_CONV_OP):
-            if isinstance(self.layer, (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d)):
-                weight = weight.transpose(1, 0)  # This performs a view
-            weight = weight.flatten(1)
+            if is_conv_transposed(self.layer):
+                weight_shape[1], weight_shape[0] = weight_shape[0], weight_shape[1]
             self.groups = self.layer.groups
 
         # Number of rows is equal to the output channels (OC)
-        self.rows = weight.shape[0]
+        self.rows = weight_shape[0]
         # Number of columns is equal to the input channels (IC)
-        self.columns = weight.shape[1]
+        self.columns = torch.prod(weight_shape[1:])
         self.len_parallel_layers = len_parallel_layers
 
         self.disable_pre_forward_hook = False
         # Some layers require knowledge from quant inputs to compute quant weights
-        self.quant_input = None
+        self.quant_metadata = None
 
     def process_input(self, inp):
         # Input is a tuple, so we take first element
         inp = inp[0]
-        # If using Quant Activations, inp could be QuantTensor
-        if isinstance(inp, QuantTensor):
-            if self.layer.weight_quant_requires_quant_input:
-                # Can minimize memory allocation by not storing actual values
-                self.quant_input = QuantTensor(
-                    value=torch.empty(
-                        1, dtype=self.layer.weight.dtype, device=self.layer.weight.device),
-                    scale=inp.scale,
-                    zero_point=inp.zero_point,
-                    bit_width=inp.bit_width,
-                    signed=inp.signed,
-                    training=inp.training)
+        inp = self.layer.input_quant(inp)
+
+        is_quant_enabled = self.layer.weight_quant.is_quant_enabled
+
+        # If using quantized activations, inp could be IntQuantTensor. In
+        # this case, we overwrite the metadata.
+        if isinstance(inp, IntQuantTensor):
+            if is_quant_enabled and self.quant_metadata is None:
+                self.quant_metadata = _CachedIO(inp, metadata_only=True)
             inp = inp.value
-        elif self.layer.is_input_quant_enabled:
-            self.quant_input = QuantTensor(
-                value=torch.empty(
-                    1, dtype=self.layer.weight.dtype, device=self.layer.weight.device),
-                scale=self.layer.quant_input_scale(),
-                zero_point=self.layer.quant_input_zero_point(),
-                bit_width=self.layer.quant_input_bit_width(),
-                signed=self.layer.is_quant_input_signed,
-                training=self.layer.training)
 
         # If input is unbatched, add batch_size = 1
         if len(inp.shape) == 1:
@@ -205,6 +245,7 @@ class GPxQ(ABC):
             batch_dim = inp.names.index('N')
             inp.rename_(None)
             inp = inp.transpose(0, batch_dim)
+
         return inp
 
     @abstractmethod
@@ -222,19 +263,27 @@ class GPxQ(ABC):
         # For QuantLinear and for some QuantConvolutional layers, we exploit the possibility
         # of quantizing only a subset of the entire matrix speeding up the computation of GPxQ
         if isinstance(self.layer, qnn.QuantLinear):
-            index = permutation_list[0][i]
-            subtensor_slice_list = [None, (index, index + 1)]
-            q = self.layer.quant_weight(
-                subtensor_slice_list=subtensor_slice_list,
-                quant_input=self.quant_input).value.unsqueeze(0)  # [1, OC, 1]
+            if self.layer.weight_quant.is_groupwise:
+                # No slicing, not optimized
+                index = permutation_list[0][i]
+                q = self.layer.quant_weight(quant_input=self.quant_metadata).value.unsqueeze(
+                    0)  # [1, OC, 1]
+                q = q[:, :, index:index + 1]  # [groups, OC/groups, 1]
+            else:
+                index = permutation_list[0][i]
+                subtensor_slice_list = [None, (index, index + 1)]
+                q = self.layer.quant_weight(
+                    subtensor_slice_list=subtensor_slice_list,
+                    quant_input=self.quant_metadata).value.unsqueeze(0)  # [1, OC, 1]
         elif isinstance(self.layer, SUPPORTED_CONV_OP):
             # For depthwise and ConvTranspose we fall back to quantizing the entire martix.
             # For all other cases, we create a mask that represent the slicing we will perform on the weight matrix
             # and we quantize only the selected dimensions.
-            if self.groups > 1 or (self.groups == 1 and isinstance(
-                    self.layer, (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d))):
+            if self.layer.weight_quant.is_groupwise or self.groups > 1 or (
+                    self.groups == 1 and
+                    isinstance(self.layer, (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d))):
 
-                quant_weight = self.layer.quant_weight(quant_input=self.quant_input)
+                quant_weight = self.layer.quant_weight(quant_input=self.quant_metadata)
                 quant_weight = quant_weight.value
 
                 if isinstance(self.layer, (qnn.QuantConvTranspose1d, qnn.QuantConvTranspose2d)):
@@ -259,7 +308,7 @@ class GPxQ(ABC):
                 index_2d_to_nd.insert(0, None)
                 q = self.layer.quant_weight(
                     subtensor_slice_list=index_2d_to_nd,
-                    quant_input=self.quant_input).value.flatten(1)  # [OC, 1]
+                    quant_input=self.quant_metadata).value.flatten(1)  # [OC, 1]
                 q = q.unsqueeze(0)  # [1, OC, 1]
         # We need to remove the last dim
         q = q.squeeze(2)  # [groups, OC/groups] or [1, OC]

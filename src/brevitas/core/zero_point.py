@@ -24,7 +24,8 @@ __all__ = [
     'StatsFromParameterZeroPoint',
     'ParameterFromRuntimeZeroPoint',
     'ParameterZeroPoint',
-    'ParameterFromStatsFromParameterZeroPoint']
+    'ParameterFromStatsFromParameterZeroPoint',
+    'PreZeroCenterZeroPoint']
 
 
 class ZeroZeroPoint(brevitas.jit.ScriptModule):
@@ -280,8 +281,9 @@ class ParameterFromStatsFromParameterZeroPoint(brevitas.jit.ScriptModule):
         output_dict = super(ParameterFromStatsFromParameterZeroPoint, self).state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars)
         # Avoid saving the init value
-        if not self.init_done:
+        if not self.init_done and not config._FULL_STATE_DICT:
             del output_dict[prefix + 'value']
+        return output_dict
 
     def _load_from_state_dict(
             self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
@@ -294,3 +296,33 @@ class ParameterFromStatsFromParameterZeroPoint(brevitas.jit.ScriptModule):
             self.init_done = True
         if config.IGNORE_MISSING_KEYS and value_key in missing_keys:
             missing_keys.remove(value_key)
+
+
+class PreZeroCenterZeroPoint(brevitas.jit.ScriptModule):
+    """Experimental ScriptModule implementation of a pre-scaling zero-point that zero-centers
+    the incoming tensors. This is intended to be used with `DecoupledIntQuant`."""
+
+    def __init__(
+            self,
+            stats_reduce_dim: int,
+            pre_zero_point_stats_input_view_shape_impl: Module,
+            pre_zero_point_shape: Optional[Tuple[int, ...]] = None) -> None:
+        super(PreZeroCenterZeroPoint, self).__init__()
+        self.stats_reduce_dim = stats_reduce_dim
+        self.stats_output_shape = pre_zero_point_shape
+        self.stats_input_view_shape_impl = pre_zero_point_stats_input_view_shape_impl
+
+    @brevitas.jit.script_method
+    def get_zero_center(self, x: Tensor) -> Tensor:
+        x = self.stats_input_view_shape_impl(x)
+        u = torch.mean(x, dim=self.stats_reduce_dim, keepdim=True)
+        z = -u.view(self.stats_output_shape)
+        return z
+
+    @brevitas.jit.script_method
+    def forward(self, x: Tensor, scale: Tensor, bit_width: Tensor) -> Tensor:
+        # NOTE: `DecoupledIntQuant` adds the `pre_zero_point` value to the scaled tensor,
+        # so this needs to return the negative of the scaled average value to perform
+        # pre-zero centering before rounding and clipping
+        z = self.get_zero_center(x) / scale  # need to scale the norm by s
+        return z

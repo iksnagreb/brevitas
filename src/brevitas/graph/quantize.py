@@ -8,11 +8,11 @@ from brevitas.core.scaling.standalone import ConstScaling
 from brevitas.core.scaling.standalone import ParameterScaling
 from brevitas.fx.brevitas_tracer import symbolic_trace
 from brevitas.graph.base import ModuleToModuleByClass
+from brevitas.graph.channel_splitting import GraphChannelSplitting
 from brevitas.graph.equalize import EqualizeGraph
 from brevitas.graph.fixed_point import CollapseConsecutiveConcats
 from brevitas.graph.fixed_point import MergeBatchNorm
 from brevitas.graph.fixed_point import MoveSplitBatchNormBeforeCat
-from brevitas.graph.per_input import AdaptiveAvgPoolToAvgPool
 from brevitas.graph.quantize_impl import act_handler
 from brevitas.graph.quantize_impl import add_output_quant_handler
 from brevitas.graph.quantize_impl import inp_placeholder_handler
@@ -24,7 +24,6 @@ from brevitas.graph.standardize import DuplicateSharedStatelessModule
 from brevitas.graph.standardize import MeanMethodToAdaptiveAvgPool2d
 from brevitas.graph.standardize import RemoveStochasticModules
 from brevitas.graph.standardize import TorchFunctionalToModule
-from brevitas.nn import quant_layer
 import brevitas.nn as qnn
 from brevitas.quant import Int8ActPerTensorFloat
 from brevitas.quant import Int8ActPerTensorFloatMinMaxInit
@@ -81,6 +80,12 @@ COMPUTE_LAYER_MAP = {
             'weight_quant': Int8WeightPerTensorFloat,
             'bias_quant': Int32Bias,
             'return_quant_tensor': True}),
+    nn.Conv3d: (
+        qnn.QuantConv3d,
+        {
+            'weight_quant': Int8WeightPerTensorFloat,
+            'bias_quant': Int32Bias,
+            'return_quant_tensor': True}),
     nn.ConvTranspose1d: (
         qnn.QuantConvTranspose1d,
         {
@@ -89,6 +94,12 @@ COMPUTE_LAYER_MAP = {
             'return_quant_tensor': True}),
     nn.ConvTranspose2d: (
         qnn.QuantConvTranspose2d,
+        {
+            'weight_quant': Int8WeightPerTensorFloat,
+            'bias_quant': Int32Bias,
+            'return_quant_tensor': True}),
+    nn.ConvTranspose3d: (
+        qnn.QuantConvTranspose3d,
         {
             'weight_quant': Int8WeightPerTensorFloat,
             'bias_quant': Int32Bias,
@@ -150,6 +161,13 @@ LAYERWISE_COMPUTE_LAYER_MAP = {
             'weight_quant': Int8WeightPerTensorFloat,
             'bias_quant': Int32Bias,
             'return_quant_tensor': False}),
+    nn.Conv3d: (
+        qnn.QuantConv3d,
+        {
+            'input_quant': Int8ActPerTensorFloat,
+            'weight_quant': Int8WeightPerTensorFloat,
+            'bias_quant': Int32Bias,
+            'return_quant_tensor': False}),
     nn.ConvTranspose1d: (
         qnn.QuantConvTranspose1d,
         {
@@ -159,6 +177,13 @@ LAYERWISE_COMPUTE_LAYER_MAP = {
             'return_quant_tensor': False}),
     nn.ConvTranspose2d: (
         qnn.QuantConvTranspose2d,
+        {
+            'input_quant': Int8ActPerTensorFloat,
+            'weight_quant': Int8WeightPerTensorFloat,
+            'bias_quant': Int32Bias,
+            'return_quant_tensor': False}),
+    nn.ConvTranspose3d: (
+        qnn.QuantConvTranspose3d,
         {
             'input_quant': Int8ActPerTensorFloat,
             'weight_quant': Int8WeightPerTensorFloat,
@@ -210,10 +235,10 @@ def align_input_quant(
     # If it is a QuantIdentity already, simply modify tensor_quant or the scaling implementations
     # based on whether we need to align the sign or not
     if isinstance(module, qnn.QuantIdentity):
-        if align_sign or module.is_quant_act_signed == shared_quant_identity.is_quant_act_signed:
+        if align_sign or module.input_quant.is_signed == shared_quant_identity.input_quant.is_signed:
             return shared_quant_identity
         else:
-            assert not module.is_quant_act_signed and shared_quant_identity.is_quant_act_signed
+            assert not module.input_quant.is_signed and shared_quant_identity.input_quant.is_signed
             quant_module_class, quant_module_kwargs = quant_identity_map['unsigned']
             return (
                 quant_module_class,
@@ -263,7 +288,10 @@ def preprocess_for_quantize(
         equalize_merge_bias=True,
         merge_bn=True,
         equalize_bias_shrinkage: str = 'vaiq',
-        equalize_scale_computation: str = 'maxabs'):
+        equalize_scale_computation: str = 'maxabs',
+        channel_splitting_ratio: float = 0.0,
+        channel_splitting_split_input: bool = True,
+        channel_splitting_criterion: str = 'maxabs'):
 
     training_state = model.training
     model.eval()
@@ -285,6 +313,11 @@ def preprocess_for_quantize(
         merge_bias=equalize_merge_bias,
         bias_shrinkage=equalize_bias_shrinkage,
         scale_computation_type=equalize_scale_computation).apply(model)
+    if channel_splitting_ratio > 0:
+        model = GraphChannelSplitting(
+            split_ratio=channel_splitting_ratio,
+            split_criterion=channel_splitting_criterion,
+            split_input=channel_splitting_split_input).apply(model)
     model.train(training_state)
     return model
 

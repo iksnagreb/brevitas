@@ -89,7 +89,9 @@ OPTIONS_DEFAULT = {
     'act_bit_width': [8],  # Act bit width
     'bias_bit_width': [32],  # Bias Bit-Width for Po2 scale
     'weight_quant_granularity': ['per_channel'],  # Scaling Per Output Channel
+    'act_quant_granularity': ['per_tensor'],  # Scaling Per Output Channel
     'act_quant_type': ['sym'],  # Act Quant Type
+    'act_scale_computation_type': ['static'],  # Act Quant Type
     'act_param_method': ['stats'],  # Act Param Method
     'weight_param_method': ['mse'],  # Weight Quant Type
     'bias_corr': [True],  # Bias Correction
@@ -105,7 +107,9 @@ OPTIONS_DEFAULT = {
     'accumulator_bit_width': [16],  # Accumulator bit width, only in combination with GPFA2Q
     'act_quant_percentile': [99.999],  # Activation Quantization Percentile
     'uint_sym_act_for_unsigned_values': [True],  # Whether to use unsigned act quant when possible
-}
+    'channel_splitting_ratio': [0.0],  # Channel Splitting ratio, 0.0 means no splitting
+    'split_input': [True],  # Whether to split the input channels when applying channel splitting
+    'merge_bn': [True]}  # Whether to merge BN layers
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet PTQ Validation')
 parser.add_argument('idx', type=int)
@@ -210,7 +214,10 @@ def ptq_torchvision_models(args):
         model = preprocess_for_quantize(
             model,
             equalize_iters=config_namespace.graph_eq_iterations,
-            equalize_merge_bias=config_namespace.graph_eq_merge_bias)
+            equalize_merge_bias=config_namespace.graph_eq_merge_bias,
+            merge_bn=config_namespace.merge_bn,
+            channel_splitting_ratio=config_namespace.channel_splitting_ratio,
+            channel_splitting_split_input=config_namespace.split_input)
     else:
         raise RuntimeError(f"{config_namespace.target_backend} backend not supported.")
 
@@ -235,7 +242,9 @@ def ptq_torchvision_models(args):
         weight_param_method=config_namespace.weight_param_method,
         act_param_method=config_namespace.act_param_method,
         bias_bit_width=config_namespace.bias_bit_width,
+        act_scale_computation_type=config_namespace.act_scale_computation_type,
         weight_quant_granularity=config_namespace.weight_quant_granularity,
+        act_quant_granularity=config_namespace.act_quant_granularity,
         act_quant_percentile=config_namespace.act_quant_percentile,
         act_quant_type=config_namespace.act_quant_type,
         scale_factor_type=config_namespace.scale_factor_type,
@@ -334,6 +343,9 @@ def validate_config(config_namespace):
         config_namespace.gpfa2q)
     if multiple_gpxqs > 1:
         is_valid = False
+    elif multiple_gpxqs == 0:
+        # no gpxq algorithm, set act order to None
+        config_namespace.gpxq_act_order = None
 
     if config_namespace.act_equalization == 'layerwise' and config_namespace.target_backend == 'fx':
         is_valid = False
@@ -364,6 +376,9 @@ def validate_config(config_namespace):
             is_valid = False
         if config_namespace.act_exponent_bit_width + config_namespace.act_mantissa_bit_width != config_namespace.act_bit_width - 1:
             is_valid = False
+    # if channel splitting is disabled, no need for split input
+    if not config_namespace.channel_splitting_ratio:
+        config_namespace.split_input = None
 
     config_namespace.is_valid = is_valid
     return config_namespace
